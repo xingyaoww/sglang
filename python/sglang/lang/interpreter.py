@@ -110,61 +110,118 @@ def run_program_batch(
         num_threads = max(96, multiprocessing.cpu_count() * 16)
     num_threads = min(num_threads, len(batch_arguments))
 
-    def generate_results():
+    if generator_style:
+        # Generator mode - yield results as they complete
+        def generate_results():
+            if num_threads == 1:
+                # Single thread - process sequentially
+                iterator = tqdm.tqdm(batch_arguments) if progress_bar else batch_arguments
+                for arguments in iterator:
+                    yield run_program(
+                        program,
+                        backend,
+                        (),
+                        arguments,
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
+            else:
+                # Multi-thread - process in chunks to avoid overwhelming ThreadPoolExecutor
+                pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
+                chunk_size = 200  # Process in smaller chunks for better streaming
+
+                with ThreadPoolExecutor(num_threads) as executor:
+                    for chunk_start in range(0, len(batch_arguments), chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, len(batch_arguments))
+                        chunk_futures = []
+
+                        # Submit chunk of tasks
+                        for i in range(chunk_start, chunk_end):
+                            future = executor.submit(
+                                run_program,
+                                program,
+                                backend,
+                                (),
+                                batch_arguments[i],
+                                default_sampling_para,
+                                False,
+                                True,
+                            )
+                            if pbar:
+                                future.add_done_callback(lambda _: pbar.update())
+                            chunk_futures.append(future)
+
+                        # Yield results from this chunk as they complete
+                        for future in chunk_futures:
+                            yield future.result()
+
+                if pbar:
+                    pbar.close()
+
+        return generate_results()
+    else:
+        # Original mode - collect all results in order
+        rets = []
         if num_threads == 1:
-            iterator = tqdm.tqdm(batch_arguments) if progress_bar else batch_arguments
-            for arguments in iterator:
-                yield run_program(
-                    program,
-                    backend,
-                    (),
-                    arguments,
-                    default_sampling_para,
-                    False,
-                    True,
-                )
-        else:
-            pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
-
-            # Process in chunks to avoid overwhelming ThreadPoolExecutor
-            # Otherwise, ThreadPoolExecutor.submit will block after adding certain number of tasks
-            # so we will never reach "yield" until all tasks are done which defeat the purpose of generator style
-            chunk_size = len(batch_arguments) if not generator_style else 200
-
-            with ThreadPoolExecutor(num_threads) as executor:
-                for chunk_start in range(0, len(batch_arguments), chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, len(batch_arguments))
-                    chunk_futures = []
-
-                    # Submit chunk of tasks
-                    for i in range(chunk_start, chunk_end):
-                        future = executor.submit(
-                            run_program,
+            # Single thread - process sequentially
+            if progress_bar:
+                for arguments in tqdm.tqdm(batch_arguments):
+                    rets.append(
+                        run_program(
                             program,
                             backend,
                             (),
-                            batch_arguments[i],
+                            arguments,
                             default_sampling_para,
                             False,
                             True,
                         )
-                        if pbar:
-                            future.add_done_callback(lambda _: pbar.update())
-                        chunk_futures.append(future)
+                    )
+            else:
+                for arguments in batch_arguments:
+                    rets.append(
+                        run_program(
+                            program,
+                            backend,
+                            (),
+                            arguments,
+                            default_sampling_para,
+                            False,
+                            True,
+                        )
+                    )
+        else:
+            # Multi-thread - maintain original order
+            if progress_bar:
+                pbar = tqdm.tqdm(total=len(batch_arguments))
 
-                    # Yield results from this chunk as they complete
-                    for future in chunk_futures:
-                        yield future.result()
+            with ThreadPoolExecutor(num_threads) as executor:
+                futures = []
+                for arguments in batch_arguments:
+                    future = executor.submit(
+                        run_program,
+                        program,
+                        backend,
+                        (),
+                        arguments,
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
+                    if progress_bar:
+                        future.add_done_callback(lambda _: pbar.update())
+                    futures.append(future)
 
-            if pbar:
+                # Collect results in original order
+                rets = [f.result() for f in futures]
+
+            if progress_bar:
                 pbar.close()
 
-    results = generate_results()
-    if not generator_style:
-        results = list(results)
-        if results:  # Only sync if we have results
-            results[-1].sync()
-    return results
+        if rets:  # Only sync if we have results
+            rets[-1].sync()
+        return rets
 
 
 def cache_program(program, backend):
